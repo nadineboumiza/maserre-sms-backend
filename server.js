@@ -12,7 +12,6 @@ const client = twilio(
 );
 
 // ── Config Firebase Admin ──────────────────────────
-// Les credentials viennent des variables d'environnement
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId:   process.env.FIREBASE_PROJECT_ID,
@@ -44,18 +43,15 @@ app.post('/send-code', async (req, res) => {
   }
 
   const code    = generateCode();
-  const expires = Date.now() + 10 * 60 * 1000; // 10 min
+  const expires = Date.now() + 10 * 60 * 1000;
 
   try {
-    // Sauvegarder dans Firestore (persiste même si
-    // Render s'endort)
     await db.collection('sms_codes').doc(phone).set({
       code,
       expires,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Envoyer SMS via Twilio
     await client.messages.create({
       body: `Votre code Ma Serre : ${code}\nValable 10 minutes.`,
       from: process.env.TWILIO_PHONE_NUMBER,
@@ -91,7 +87,6 @@ app.post('/verify-code', async (req, res) => {
   }
 
   try {
-    // Lire depuis Firestore
     const doc = await db
       .collection('sms_codes')
       .doc(phone)
@@ -106,7 +101,6 @@ app.post('/verify-code', async (req, res) => {
 
     const stored = doc.data();
 
-    // Code expiré
     if (Date.now() > stored.expires) {
       await doc.ref.delete();
       return res.status(400).json({
@@ -115,7 +109,6 @@ app.post('/verify-code', async (req, res) => {
       });
     }
 
-    // Code incorrect
     if (stored.code !== code) {
       return res.status(400).json({
         success: false,
@@ -123,7 +116,6 @@ app.post('/verify-code', async (req, res) => {
       });
     }
 
-    // ✅ Code correct → supprimer et valider
     await doc.ref.delete();
 
     return res.json({
@@ -135,6 +127,42 @@ app.post('/verify-code', async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Erreur serveur : ' + error.message,
+    });
+  }
+});
+
+// ══════════════════════════════════════════════════
+//  POST /send-alert  ← NOUVEAU
+//  Body: { phone, message }
+// ══════════════════════════════════════════════════
+app.post('/send-alert', async (req, res) => {
+  const { phone, message } = req.body;
+
+  if (!phone || !message) {
+    return res.status(400).json({
+      success: false,
+      message: 'Numéro et message requis.',
+    });
+  }
+
+  try {
+    await client.messages.create({
+      body: `🌱 Ma Serre — ALERTE :\n${message}`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to:   phone,
+    });
+
+    console.log(`Alerte SMS envoyee a ${phone} : ${message}`);
+
+    return res.json({
+      success: true,
+      message: 'Alerte SMS envoyée.',
+    });
+  } catch (error) {
+    console.error('Erreur alerte:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Erreur : ' + error.message,
     });
   }
 });
