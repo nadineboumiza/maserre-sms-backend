@@ -1,81 +1,86 @@
 const express  = require('express');
 const twilio   = require('twilio');
-const crypto   = require('crypto');
+const admin    = require('firebase-admin');
 
-const app  = express();
+const app = express();
 app.use(express.json());
 
-// ── Config Twilio (remplacez par vos vraies clés) ──
-const TWILIO_ACCOUNT_SID  = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN   = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
+// ── Config Twilio ──────────────────────────────────
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+// ── Config Firebase Admin ──────────────────────────
+// Les credentials viennent des variables d'environnement
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId:   process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey:  process.env.FIREBASE_PRIVATE_KEY
+                   .replace(/\\n/g, '\n'),
+  }),
+});
 
-// ── Stockage temporaire des codes (en mémoire) ─────
-// Code expire après 10 minutes
-const codes = new Map();
+const db = admin.firestore();
 
 // ── Générer code à 6 chiffres ──────────────────────
 function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return Math.floor(100000 + Math.random() * 900000)
+    .toString();
 }
 
 // ══════════════════════════════════════════════════
 //  POST /send-code
-//  Body: { phone: "+21612345678" }
 // ══════════════════════════════════════════════════
 app.post('/send-code', async (req, res) => {
   const { phone } = req.body;
 
-  if (!phone) {
+  if (!phone || !phone.startsWith('+')) {
     return res.status(400).json({
       success: false,
-      message: 'Numéro de téléphone requis.',
-    });
-  }
-
-  // Valider format international
-  if (!phone.startsWith('+')) {
-    return res.status(400).json({
-      success: false,
-      message: 'Le numéro doit commencer par + (ex: +21612345678).',
+      message: 'Numéro invalide. Format: +21612345678',
     });
   }
 
   const code    = generateCode();
   const expires = Date.now() + 10 * 60 * 1000; // 10 min
 
-  // Stocker code + expiration
-  codes.set(phone, { code, expires });
-
   try {
+    // Sauvegarder dans Firestore (persiste même si
+    // Render s'endort)
+    await db.collection('sms_codes').doc(phone).set({
+      code,
+      expires,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Envoyer SMS via Twilio
     await client.messages.create({
       body: `Votre code Ma Serre : ${code}\nValable 10 minutes.`,
-      from: TWILIO_PHONE_NUMBER,
+      from: process.env.TWILIO_PHONE_NUMBER,
       to:   phone,
     });
 
-    console.log(`SMS envoyé à ${phone} : ${code}`);
+    console.log(`SMS envoye a ${phone} : ${code}`);
 
     return res.json({
       success: true,
       message: 'Code SMS envoyé avec succès.',
     });
   } catch (error) {
-    console.error('Erreur Twilio:', error.message);
+    console.error('Erreur:', error.message);
     return res.status(500).json({
       success: false,
-      message: 'Erreur envoi SMS : ' + error.message,
+      message: 'Erreur : ' + error.message,
     });
   }
 });
 
 // ══════════════════════════════════════════════════
 //  POST /verify-code
-//  Body: { phone: "+21612345678", code: "123456" }
 // ══════════════════════════════════════════════════
-app.post('/verify-code', (req, res) => {
+app.post('/verify-code', async (req, res) => {
   const { phone, code } = req.body;
 
   if (!phone || !code) {
@@ -85,45 +90,58 @@ app.post('/verify-code', (req, res) => {
     });
   }
 
-  const stored = codes.get(phone);
+  try {
+    // Lire depuis Firestore
+    const doc = await db
+      .collection('sms_codes')
+      .doc(phone)
+      .get();
 
-  // Code inexistant
-  if (!stored) {
-    return res.status(400).json({
+    if (!doc.exists) {
+      return res.status(400).json({
+        success: false,
+        message: 'Aucun code envoyé à ce numéro.',
+      });
+    }
+
+    const stored = doc.data();
+
+    // Code expiré
+    if (Date.now() > stored.expires) {
+      await doc.ref.delete();
+      return res.status(400).json({
+        success: false,
+        message: 'Code expiré. Demandez un nouveau code.',
+      });
+    }
+
+    // Code incorrect
+    if (stored.code !== code) {
+      return res.status(400).json({
+        success: false,
+        message: 'Code incorrect. Réessayez.',
+      });
+    }
+
+    // ✅ Code correct → supprimer et valider
+    await doc.ref.delete();
+
+    return res.json({
+      success: true,
+      message: 'Numéro vérifié avec succès.',
+    });
+  } catch (error) {
+    console.error('Erreur:', error.message);
+    return res.status(500).json({
       success: false,
-      message: 'Aucun code envoyé à ce numéro.',
+      message: 'Erreur serveur : ' + error.message,
     });
   }
-
-  // Code expiré
-  if (Date.now() > stored.expires) {
-    codes.delete(phone);
-    return res.status(400).json({
-      success: false,
-      message: 'Code expiré. Demandez un nouveau code.',
-    });
-  }
-
-  // Code incorrect
-  if (stored.code !== code) {
-    return res.status(400).json({
-      success: false,
-      message: 'Code incorrect.',
-    });
-  }
-
-  // ✅ Code correct → supprimer et valider
-  codes.delete(phone);
-
-  return res.json({
-    success: true,
-    message: 'Numéro vérifié avec succès.',
-  });
 });
 
 // ── Health check ───────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'Ma Serre SMS API is running 🌱' });
+  res.json({ status: 'Ma Serre SMS API is running' });
 });
 
 // ── Démarrage ──────────────────────────────────────
